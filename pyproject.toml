@@ -1,0 +1,12 @@
+[project]
+name = "customer-lifetime-value"
+version = "0.1.0"
+description = "Lab: customer lifetime value as a Markov decision process"
+requires-python = ">=3.11"
+dependencies = ["numpy", "pandas"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
