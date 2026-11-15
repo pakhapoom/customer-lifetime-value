@@ -1,11 +1,11 @@
 """Step 1 - training: tables in data/ -> learned MDP -> Bellman -> data/model.npz
 
-    uv run python train.py
+    uv run src/train.py
 """
 
 import numpy as np
 
-from src import mdp
+import mdp
 
 products, customers, holdings, offers = mdp.load_tables()
 panel = mdp.build_panel(products, customers, holdings, offers)

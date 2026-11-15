@@ -1,12 +1,12 @@
 """Step 0 - write the mock tables to data/.
 
-    uv run python mock_data.py [--customers N] [--months M] [--seed S]
+    uv run src/mock_data.py [--customers N] [--months M] [--seed S]
 """
 
 import argparse
 from pathlib import Path
 
-from src import world
+import world
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--customers", type=int, default=20_000)

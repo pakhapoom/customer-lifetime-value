@@ -1,11 +1,11 @@
 """Step 2 - inference: CLV and next best action for every current customer.
 
-    uv run python predict.py        -> data/predictions.csv
+    uv run src/predict.py        -> data/predictions.csv
 """
 
 import numpy as np
 
-from src import mdp
+import mdp
 
 products, customers, holdings, offers = mdp.load_tables()
 model = np.load("data/model.npz")

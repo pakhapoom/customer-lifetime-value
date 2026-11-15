@@ -4,7 +4,7 @@ Simulates the true future of a sample of current customers many times, under
 (a) the bank's historical behaviour and (b) the learned policy, and compares
 the realised discounted profit with what the model predicted.
 
-    uv run python evaluate.py [--sample N] [--rollouts R]
+    uv run src/evaluate.py [--sample N] [--rollouts R]
 """
 
 import argparse
@@ -12,7 +12,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from src import mdp, world
+import mdp, world
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--sample", type=int, default=3000)

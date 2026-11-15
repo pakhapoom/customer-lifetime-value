@@ -8,7 +8,7 @@ to generate history and to score predictions by simulating the future.
 import numpy as np
 import pandas as pd
 
-from src.mdp import GAMMA, OFFER_COST
+from mdp import GAMMA, OFFER_COST
 
 START = "2022-01"  # first month of history
 P_OFFER = 0.3  # behaviour policy: chance of making an offer in a month

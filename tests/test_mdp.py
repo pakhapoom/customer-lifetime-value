@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from src import mdp, world
+import mdp, world
 
 
 def test_policy_evaluation_matches_closed_form():
