@@ -1,68 +1,83 @@
-"""Step 3 - score the model against the hidden truth (only possible with mock data).
+"""Step 3 - holdout evaluation on the test customers.
 
-Simulates the true future of a sample of current customers many times, under
-(a) the bank's historical behaviour and (b) the learned policy, and compares
-the realised discounted profit with what the model predicted.
+For each test customer, the realised discounted reward over the whole data window
+(T = 53 months: the 36 trained on plus 17 more) is compared with the model's
+T-month value V_T of their state at the snapshot, grouped by (segment, initial
+state). Three estimates are compared:
 
-    uv run src/evaluate.py [--sample N] [--rollouts R]
+  1. normal        normal rewards, normal transitions
+  2. conservative  conservative (geometric-mean) rewards, normal transitions
+  3. p - 1SE       normal rewards, every s -> s' rate lowered by one Poisson SE
+
+    uv run src/evaluate.py
 """
-
-import argparse
 
 import numpy as np
 import pandas as pd
 
-import mdp, world
+import mdp
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--sample", type=int, default=3000)
-parser.add_argument("--rollouts", type=int, default=30)
-parser.add_argument("--seed", type=int, default=1)
-args = parser.parse_args()
-rng = np.random.default_rng(args.seed)
+MIN_N = 30  # groups with at least this many test customers are "reliable"
 
-products, customers, holdings, offers = mdp.load_tables()
+products, customers, snapshot, transactions = mdp.load_tables()
 model = np.load("data/model.npz")
-panel = mdp.build_panel(products, customers, holdings, offers)
-K = len(products)
+panel = mdp.build_panel(products, customers, snapshot, transactions)
+T = panel["state"].shape[1] - 1
+test = ~mdp.split(customers["customer_id"])
 
-now = panel["mask"][:, -1]
-sample = rng.choice(np.flatnonzero(now > 0), args.sample, replace=False)
-g, h = panel["segment"][sample], now[sample]
-appetite, churn_mult = world.traits(customers.iloc[sample])
+estimates = {
+    "normal": mdp.finite_horizon(model["R_normal"], model["P"], T),
+    "conservative": mdp.finite_horizon(model["R_conservative"], model["P"], T),
+    "p - 1SE": mdp.finite_horizon(model["R_normal"], model["P_lower"], T),
+}
 
-# Each sampled customer is simulated `rollouts` times.
-rep = np.repeat(np.arange(args.sample), args.rollouts)
-h0 = mdp.bits_of(K)[h[rep]] == 1
-pow2 = 1 << np.arange(K)
+# Realised: sum_t gamma^t x (that month's reward), t = months since the journey start.
+ev = panel["events"]
+pv = np.bincount(ev["c"], weights=ev["reward"] * mdp.GAMMA ** ev["m"], minlength=len(customers))
+g, s0 = panel["segment"], panel["state"][:, 0]
+keep = test & (model["n_s"][g, s0] > 0)  # initial state has an estimate
+print(f"test customers {test.sum():,} | matched to a trained state {keep.sum():,} | T = {T} months\n")
+
+df = pd.DataFrame({"g": g[keep], "s": s0[keep], "realised": pv[keep]})
+obs = df.groupby(["g", "s"])["realised"].agg(n_test="size", observed="mean", sd="std").reset_index()
+obs["SE"] = obs["sd"].fillna(0.0) / np.sqrt(obs["n_test"])
+obs["lower"], obs["upper"] = obs["observed"] - 1.96 * obs["SE"], obs["observed"] + 1.96 * obs["SE"]
+for name, V in estimates.items():
+    obs[name] = V[obs["g"], obs["s"]]
+obs["segment"] = np.array(model["segments"])[obs["g"]]
+reliable = (obs["n_test"] >= MIN_N) & (obs["SE"] > 0)
 
 
-def learned_policy(held, rows, rng):
-    return model["policy"][g[rep][rows], held @ pow2]
+def spearman(x, y):
+    return x.rank().corr(y.rank()) if len(x) >= 2 else np.nan
 
 
-def simulate(policy):
-    v = world.rollout(h0, appetite[rep], churn_mult[rep], policy, rng)
-    return v.reshape(args.sample, args.rollouts).mean(axis=1)
+def summary(d, r):
+    rows = []
+    for name in estimates:
+        z = (d.loc[r, name] - d.loc[r, "observed"]) / d.loc[r, "SE"]
+        rows.append(
+            {
+                "estimate": name,
+                "groups": len(d),
+                f"n>={MIN_N}": int(r.sum()),
+                "L_T std RMS": np.sqrt(np.mean(z**2)) if r.any() else np.nan,
+                "spearman": spearman(d[name], d["observed"]),
+                f"spearman n>={MIN_N}": spearman(d.loc[r, name], d.loc[r, "observed"]),
+                "below 95%": int((d.loc[r, name] < d.loc[r, "lower"]).sum()),
+                "above 95%": int((d.loc[r, name] > d.loc[r, "upper"]).sum()),
+                "pred/obs": (d[name] * d["n_test"]).sum() / (d["observed"] * d["n_test"]).sum(),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-true_current = simulate(world.behaviour_policy)
-true_learned = simulate(learned_policy)
-pred_current = model["V_current"][g, h]
-pred_optimal = model["V_optimal"][g, h]
-
-print(f"{args.sample:,} customers x {args.rollouts} simulated futures each\n")
-print("CLV under the current policy, by predicted-CLV quintile (mean per customer):")
-q = pd.qcut(pred_current, 5, labels=False)
-table = pd.DataFrame({"predicted": pred_current, "true": true_current}).groupby(q).mean()
-table["error"] = table["predicted"] / table["true"] - 1
-table.index = [f"Q{i + 1}" for i in table.index]
-print(table.to_string(formatters={"predicted": "{:,.0f}".format, "true": "{:,.0f}".format, "error": "{:+.1%}".format}))
-print(f"\noverall   predicted {pred_current.mean():,.0f} | true {true_current.mean():,.0f} "
-      f"| error {pred_current.mean() / true_current.mean() - 1:+.1%}")
-print(f"per-customer correlation(predicted, true): {np.corrcoef(pred_current, true_current)[0, 1]:.3f}")
-
-print("\nLearned policy (mean CLV per customer):")
-print(f"  true, current policy   {true_current.mean():>10,.0f}")
-print(f"  true, learned policy   {true_learned.mean():>10,.0f}  ({true_learned.mean() / true_current.mean() - 1:+.1%})")
-print(f"  model's own prediction {pred_optimal.mean():>10,.0f}  ({pred_optimal.mean() / true_learned.mean() - 1:+.1%} vs true)")
+fmt = {"L_T std RMS": "{:.2f}".format, "spearman": "{:.3f}".format, f"spearman n>={MIN_N}": "{:.3f}".format, "pred/obs": "{:.3f}".format}
+print(f"Per segment (L_T = RMS of (estimate - observed) / SE over groups with n_test >= {MIN_N}; "
+      "pred/obs = customer-weighted mean ratio):")
+per_segment = pd.concat(
+    [summary(d, reliable[d.index]).assign(segment=seg) for seg, d in obs.groupby("segment")], ignore_index=True
+)
+print(per_segment.set_index(["segment", "estimate"]).to_string(formatters=fmt))
+print("\nOverall:")
+print(summary(obs, reliable).set_index("estimate").to_string(formatters=fmt))

@@ -3,82 +3,103 @@ import pandas as pd
 
 import mdp, world
 
-
-def test_policy_evaluation_matches_closed_form():
-    # One product (revenue r, monthly retention q); never offered.
-    # V(holding it) = r / (1 - gamma * q)
-    r, q = 10.0, 0.9
-    P = np.array([[[1.0, 0.0], [1 - q, q]]])
-    model = {"P_none": P, "P_rej": P, "acc": np.zeros((1, 2, 1)), "R": np.array([[0.0, 0.0], [r, r - 2.0]])}
-    V, _ = mdp.evaluate_policy(model, np.array([[[1.0, 0.0], [1.0, 0.0]]]))
-    assert np.isclose(V[0, 1], r / (1 - mdp.GAMMA * q))
-    assert V[0, 0] == 0.0
+PRODUCTS = pd.DataFrame(
+    {"product_id": ["P01", "P02", "P03"], "group_id": ["G1", "G1", "G2"], "one_time": [False, True, False]}
+)
 
 
-def test_optimize_offers_a_product_that_will_be_accepted():
-    # Two products A (10/month) and B (50/month), nothing ever churns.
-    # A-holders always accept B, so the best action when holding only A is "offer B".
-    rev = np.array([10.0, 50.0])
-    bits = mdp.bits_of(2)
-    P = np.eye(4)[None]
-    acc = np.zeros((1, 4, 2))
-    acc[0, 1, 1] = 1.0
-    R = np.repeat((bits @ rev)[:, None], 3, axis=1)
-    R[:, 1:] -= mdp.OFFER_COST
-    R[0] = 0.0
-    valid = np.ones((4, 3), dtype=bool)
-    valid[:, 1:] = bits == 0
-    valid[0, 1:] = False
-    V, policy = mdp.optimize({"P_none": P, "P_rej": P, "acc": acc, "R": R, "valid": valid})
-    forever = 1 / (1 - mdp.GAMMA)
-    assert policy[0].tolist() == [0, 2, 0, 0]
-    assert np.isclose(V[0, 3], 60 * forever)
-    assert np.isclose(V[0, 1], 10 - mdp.OFFER_COST + mdp.GAMMA * 60 * forever)
+def test_solve_matches_closed_form():
+    # One group. {} -> {G1} at rate p, {G1} is absorbing with reward r1.
+    # V({G1}) = r1 / (1 - gamma);  V({}) = (r0 + gamma p V({G1})) / (1 - gamma (1 - p))
+    r0, r1, p, gamma = 5.0, 10.0, 0.2, mdp.GAMMA
+    R = np.array([[r0, r1]])
+    P = np.array([[[1 - p, p], [0.0, 1.0]]])
+    V = mdp.solve(R, P)
+    assert np.isclose(V[0, 1], r1 / (1 - gamma))
+    assert np.isclose(V[0, 0], (r0 + gamma * p * V[0, 1]) / (1 - gamma * (1 - p)))
 
 
-def test_build_panel_reconstructs_monthly_holdings():
-    customers = pd.DataFrame(
+def test_solve_equals_linear_solve_and_long_finite_horizon():
+    customers, snapshot, transactions = world.simulate_history(n_customers=3000, n_months=24, seed=1)
+    panel = mdp.build_panel(world.PRODUCTS, customers, snapshot, transactions)
+    model = mdp.fit(panel, np.ones(len(customers), dtype=bool), 24)
+    V = mdp.solve(model["R_normal"], model["P"])
+    for g in range(len(panel["segments"])):
+        H = V.shape[1]
+        exact = np.linalg.solve(np.eye(H) - mdp.GAMMA * model["P"][g], model["R_normal"][g])
+        assert np.allclose(V[g], exact)
+    assert np.allclose(mdp.finite_horizon(model["R_normal"], model["P"], 1), model["R_normal"])
+    assert np.allclose(mdp.finite_horizon(model["R_normal"], model["P"], 2000), V)
+
+
+def test_build_panel_states_actions_and_rewards():
+    customers = pd.DataFrame({"customer_id": ["C1", "C2"], "segment": ["S1", "S2"]})
+    snapshot = pd.DataFrame({"customer_id": ["C1"], "group_id": ["G1"]})
+    transactions = pd.DataFrame(
         {
-            "customer_id": ["C1", "C2"],
-            "age": [40, 25],
-            "monthly_income": [30_000, 10_000],
-            "signup_date": pd.to_datetime(["2022-01-15", "2022-02-03"]),
+            "customer_id": ["C1", "C1", "C2", "C1"],
+            "txn_date": pd.to_datetime(["2022-02-03", "2022-02-20", "2022-01-09", "2022-04-01"]),
+            "product_id": ["P03", "P02", "P01", "P01"],
+            "revenue": [120.0, 50.0, 12.0, 0.0],
         }
     )
-    holdings = pd.DataFrame(
+    panel = mdp.build_panel(PRODUCTS, customers, snapshot, transactions)
+    # G1 = bit 1, G2 = bit 2. Months Jan..Apr 2022 plus "now".
+    assert panel["state"].tolist() == [[1, 1, 3, 3, 3], [0, 1, 1, 1, 1]]
+    ev = panel["events"].set_index(["c", "m"])
+    assert ev.loc[(0, 1), "action"] == "{G1/P02,G2/P03}"  # two products in a month = one compound action
+    assert ev.loc[(0, 1), "next_state"] == 3
+    assert np.isclose(ev.loc[(0, 1), "reward"], 120 * mdp.DEFAULT_MULTIPLIER + 50 * mdp.ONE_TIME_MULTIPLIER)
+    assert ev.loc[(0, 3), "next_state"] == ev.loc[(0, 3), "state"] == 3  # bought within a held group
+    assert ev.loc[(1, 0), "action"] == "{G1/P01}"
+
+
+def test_fit_rates_rewards_and_transitions():
+    # Segment S1, 4 customers in {} for one month. Two buy different G1 products
+    # (two actions, same next state), one buys G2, one buys nothing.
+    customers = pd.DataFrame({"customer_id": ["A", "B", "C", "D"], "segment": "S1"})
+    snapshot = pd.DataFrame({"customer_id": [], "group_id": []})
+    transactions = pd.DataFrame(
         {
-            "customer_id": ["C1", "C1", "C2"],
-            "product_id": ["P001", "P004", "P003"],
-            "purchase_date": pd.to_datetime(["2022-01-15", "2022-03-10", "2022-02-03"]),
-            "end_date": pd.to_datetime([None, "2022-05-20", "2022-04-01"]),
+            "customer_id": ["A", "B", "C"],
+            "txn_date": pd.to_datetime(["2022-01-05"] * 3),
+            "product_id": ["P01", "P02", "P03"],
+            "revenue": [100.0, 40.0, 300.0],
         }
     )
-    offers = pd.DataFrame(
-        {
-            "customer_id": ["C1", "C1"],
-            "product_id": ["P004", "P010"],
-            "offer_date": pd.to_datetime(["2022-03-10", "2022-04-05"]),
-            "accepted": [True, False],
-        }
-    )
-    panel = mdp.build_panel(world.PRODUCTS, customers, holdings, offers)
-    # Months Jan..Jun 2022. P001 = bit 1, P003 = bit 4, P004 = bit 8.
-    assert panel["mask"].tolist() == [[0, 1, 1, 9, 9, 1], [0, 0, 4, 4, 0, 0]]
-    assert panel["action"].tolist() == [[0, 0, 4, 10, 0], [0, 0, 0, 0, 0]]
-    assert panel["accepted"][0].tolist() == [False, False, True, False, False]
-    assert panel["segment"].tolist() == [4, 0]
+    panel = mdp.build_panel(PRODUCTS, customers, snapshot, transactions)
+    model = mdp.fit(panel, np.ones(4, dtype=bool), 1)
+    a = model["actions"].set_index("action")
+    assert np.allclose(a["lambda"], 0.25) and (a["n_s"] == 4).all()
+    assert np.isclose(a["sd_lambda"].iloc[0], 1 / 4)
+    P = model["P"][0]
+    assert np.isclose(P[0, 1], 0.5)  # {} -> {G1}: sum of two actions
+    assert np.isclose(P[0, 2], 0.25) and np.isclose(P[0, 0], 0.25)
+    m = mdp.DEFAULT_MULTIPLIER
+    assert np.isclose(model["R_normal"][0, 0], 0.25 * (100 * m + 40 + 300 * m))
+    low = model["P_lower"][0]
+    assert np.isclose(low[0, 1], max(0.5 - np.sqrt(2) / 4, 0.0))  # SEs of the two actions add in quadrature
+    assert np.isclose(low[0, 2], 0.0) and np.isclose(low[0].sum(), 1.0)
+
+
+def test_split_is_deterministic_and_about_70_30():
+    ids = [f"C{i:06d}" for i in range(5000)]
+    train = mdp.split(ids)
+    assert (train == mdp.split(ids)).all()
+    assert abs(train.mean() - mdp.TRAIN_RATIO) < 0.03
 
 
 def test_pipeline_end_to_end_on_small_world():
-    customers, holdings, offers = world.simulate_history(n_customers=1500, n_months=18, seed=3)
-    panel = mdp.build_panel(world.PRODUCTS, customers, holdings, offers)
-    held_now = mdp.bits_of(world.K)[panel["mask"][:, -1]].sum()
-    assert held_now == holdings["end_date"].isna().sum()
-
-    model = mdp.fit(panel, world.PRODUCTS)
-    assert np.allclose(model["P_none"].sum(axis=2), 1.0)
-    V_cur, _ = mdp.evaluate_policy(model, model["pi"])
-    V_opt, policy = mdp.optimize(model)
-    assert np.isfinite(V_cur).all() and np.allclose(V_cur[:, 0], 0.0, atol=1e-6)
-    assert (V_opt >= V_cur - 1e-6).all()  # optimal is at least as good as current
-    assert model["valid"][np.arange(1 << world.K), policy].all()  # never offers a held product
+    customers, snapshot, transactions = world.simulate_history(n_customers=4000, n_months=30, seed=3)
+    panel = mdp.build_panel(world.PRODUCTS, customers, snapshot, transactions)
+    train = mdp.split(customers["customer_id"])
+    model = mdp.fit(panel, train, 24)
+    for P in (model["P"], model["P_lower"]):
+        assert np.allclose(P.sum(axis=2), 1.0) and (P >= 0).all()
+        g, s, s2 = np.nonzero(P)
+        assert ((s & s2) == s).all()  # only ever moves to a superset: the graph is a DAG
+    assert (model["P_lower"] <= model["P"] + 1e-12)[:, ~np.eye(128, dtype=bool)].all()
+    V = mdp.solve(model["R_normal"], model["P"])
+    V_cons = mdp.solve(model["R_conservative"], model["P"])
+    assert np.isfinite(V).all() and (V_cons <= V + 1e-9).all()  # geometric mean <= arithmetic mean
+    assert (V[model["n_s"] == 0] == 0).all()  # unseen states carry no value

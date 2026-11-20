@@ -1,214 +1,217 @@
-"""The MDP: build states from raw tables, learn the model, solve with Bellman.
+"""The MDP: build monthly states from raw tables, estimate the model, solve Bellman.
 
-State  (g, h)  g = demographic segment (age band x income band, 9 values)
-               h = bitmask of the products held (2^K values, K = 10 -> 1024)
-               h = 0 (holds nothing) means churned and is absorbing.
-Action a = 0 "none", or k >= 1 "offer product k-1". Offering a product the
-       customer already holds is not allowed.
-Reward R(h, a) = sum of est. monthly revenue of held products - offer cost.
+Segment g     a model key, not part of the state: every quantity below is
+              estimated, and every Bellman equation solved, per segment.
+State   s     the set of product groups the customer has ever held, as a bitmask
+              over groups (7 groups -> 128 states). Groups are only ever added,
+              so s only grows and the state graph is a DAG ordered by set size.
+Action  a     the set of products bought during the month, e.g. {G2/P05,G4/P11}.
+              Buying nothing is the implicit "no purchase" action.
+Transition    deterministic given the action:  s' = s | groups(a).
+              Several actions can lead from s to the same s' (any product of a
+              group), and buying a product of a group already held keeps s' = s.
+Reward  r     per transaction, booked revenue x multiplier, where the multiplier
+              spreads the expected first-year revenue over the product lifetime
+              capped at 36 months:  (1/12) * sum_{k<36} gamma^k  (1.0 for
+              one-time products). R(s, a) = mean reward of the month.
 
-Transitions are learned in three pieces rather than one table per action:
+    lambda(a|s) = sum_m N_m(s, a) / sum_m N_m(s)       monthly action rate
+    R(s)        = sum_a lambda(a|s) R(s, a)
+    P(s'|s)     = sum_{a: s|groups(a) = s'} lambda(a|s)      for s' != s
+    P(s|s)      = 1 - sum_{s' != s} P(s'|s)                   no purchase, or same-group purchase
 
-    P(h'|g,h, none)    = P_none[g,h,h']              counted from no-offer months
-    P(h'|g,h, offer k) = acc[g,h,k]     * (P_none[g,h,.] with product k added)
-                       + (1-acc[g,h,k]) * P_rej[g,h,h']   counted from rejected-offer months
+    V(s) = R(s) + gamma * sum_s' P(s'|s) V(s')
 """
 
-from functools import reduce
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-GAMMA = 0.99  # monthly discount factor
-OFFER_COST = 2.0
-AGE_EDGES = [30, 50]
-INCOME_EDGES = [25_000, 60_000]
-N_SEGMENTS = 9
+JOURNEY_START = "2022-01"  # first month of history; the holdings snapshot is taken just before
+JOURNEY_MONTHS = 36  # training window
+DAILY_DISCOUNT = 0.998890
+GAMMA = DAILY_DISCOUNT**30  # monthly discount factor
+REWARD_MONTHS = 36  # product lifetime cap used by the reward multiplier
+TRAIN_RATIO = 0.7
+SPLIT_SALT = "clv_mdp"
 
 
-def segment_of(customers):
-    age_i = np.digitize(customers["age"], AGE_EDGES)
-    income_i = np.digitize(customers["monthly_income"], INCOME_EDGES)
-    return age_i * 3 + income_i
+def annuity(months, gamma=GAMMA):
+    """sum_{k=0}^{months-1} gamma^k"""
+    return (1 - gamma**months) / (1 - gamma)
 
 
-def bits_of(n_products):
-    """[2^K, K] table: bits_of(K)[h, k] == 1 if holdings mask h contains product k."""
-    return (np.arange(1 << n_products)[:, None] >> np.arange(n_products)) & 1
+DEFAULT_MULTIPLIER = annuity(REWARD_MONTHS) / 12
+ONE_TIME_MULTIPLIER = 1.0
+
+
+def popcount(n_groups):
+    """[2^G] number of groups in each state."""
+    s = np.arange(1 << n_groups)
+    return ((s[:, None] >> np.arange(n_groups)) & 1).sum(axis=1)
+
+
+def state_names(groups):
+    """[2^G] labels such as "{}" or "{G1,G3}"."""
+    return np.array(
+        ["{" + ",".join(g for i, g in enumerate(groups) if s >> i & 1) + "}" for s in range(1 << len(groups))]
+    )
 
 
 def load_tables(data_dir="data"):
     d = Path(data_dir)
     return (
         pd.read_csv(d / "products.csv"),
-        pd.read_csv(d / "customers.csv", parse_dates=["signup_date"]),
-        pd.read_csv(d / "holdings.csv", parse_dates=["purchase_date", "end_date"]),
-        pd.read_csv(d / "offers.csv", parse_dates=["offer_date"]),
+        pd.read_csv(d / "customers.csv"),
+        pd.read_csv(d / "holdings_snapshot.csv"),
+        pd.read_csv(d / "transactions.csv", parse_dates=["txn_date"]),
     )
 
 
-def build_panel(products, customers, holdings, offers):
-    """Turn the event tables into a monthly panel.
+def split(customer_ids, ratio=TRAIN_RATIO, salt=SPLIT_SALT):
+    """Deterministic hash split: True = train, False = test."""
+    bucket = [int(hashlib.md5(f"{c}{salt}".encode()).hexdigest(), 16) % 100 for c in customer_ids]
+    return np.array(bucket) < ratio * 100
 
-    mask[c, m] is what customer c holds at the *start* of month m: products
-    bought before month m and not ended before month m. An offer, purchase or
-    end dated in month m moves the customer from mask[c, m] to mask[c, m+1].
-    The last column (one month past the last event) is the "as of now" state.
+
+def build_panel(products, customers, snapshot, transactions):
+    """Turn the tables into a monthly panel.
+
+    state[c, m] is customer c's state at the *start* of month m: the groups in
+    the snapshot plus the groups of everything bought before month m. The last
+    column (after the last month) is the "as of now" state.
+
+    events has one row per customer-month with at least one purchase: the
+    compound action, the groups it adds, and the month's total reward.
     """
-    cust_ix, prod_ix = pd.Index(customers["customer_id"]), pd.Index(products["product_id"])
-    first = customers["signup_date"].min()
-    origin = first.year * 12 + first.month
+    groups = list(pd.unique(products["group_id"]))
+    segments = sorted(customers["segment"].unique())
+    cust_ix, group_ix = pd.Index(customers["customer_id"]), pd.Index(groups)
+    group_bit = 1 << group_ix.get_indexer(products["group_id"])
+    multiplier = np.where(products["one_time"], ONE_TIME_MULTIPLIER, DEFAULT_MULTIPLIER)
 
-    def month(s):
-        return (s.dt.year * 12 + s.dt.month).to_numpy() - origin
+    init = np.zeros(len(customers), dtype=np.int64)
+    np.bitwise_or.at(init, cust_ix.get_indexer(snapshot["customer_id"]), 1 << group_ix.get_indexer(snapshot["group_id"]))
 
-    c = cust_ix.get_indexer(holdings["customer_id"])
-    bit = 1 << prod_ix.get_indexer(holdings["product_id"])
-    bought = month(holdings["purchase_date"]).astype(int)
-    end_f = month(holdings["end_date"])  # NaN while still held
-    ended = ~np.isnan(end_f)
-    end = end_f[ended].astype(int)
-    off_c = cust_ix.get_indexer(offers["customer_id"])
-    off_m = month(offers["offer_date"]).astype(int)
-    M = int(max(bought.max(), end.max(initial=0), off_m.max(initial=0))) + 1
+    k = pd.Index(products["product_id"]).get_indexer(transactions["product_id"])
+    start = pd.Period(JOURNEY_START, "M")
+    t = transactions["txn_date"].dt
+    tx = pd.DataFrame(
+        {
+            "c": cust_ix.get_indexer(transactions["customer_id"]),
+            "m": (t.year - start.year) * 12 + t.month - start.month,
+            "item": products["group_id"].to_numpy()[k] + "/" + products["product_id"].to_numpy()[k],
+            "bit": group_bit[k],
+            "reward": transactions["revenue"].fillna(0.0).to_numpy() * multiplier[k],
+        }
+    )
+    M = int(tx["m"].max()) + 1 if len(tx) else 0
+    by_month = tx.groupby(["c", "m"])
+    events = pd.DataFrame(
+        {
+            "action": "{" + tx.drop_duplicates(["c", "m", "item"]).sort_values("item").groupby(["c", "m"])["item"].agg(",".join) + "}",
+            "a_mask": tx.drop_duplicates(["c", "m", "bit"]).groupby(["c", "m"])["bit"].sum(),
+            "reward": by_month["reward"].sum(),
+        }
+    ).reset_index()
 
-    # Difference array: +bit the month after purchase, -bit the month after the end.
-    mask = np.zeros((len(customers), M + 2), dtype=np.int64)
-    np.add.at(mask, (c, bought + 1), bit)
-    np.add.at(mask, (c[ended], end + 1), -bit[ended])
-    mask = mask.cumsum(axis=1)[:, : M + 1]
-
-    action = np.zeros((len(customers), M), dtype=int)
-    accepted = np.zeros((len(customers), M), dtype=bool)
-    action[off_c, off_m] = prod_ix.get_indexer(offers["product_id"]) + 1
-    accepted[off_c, off_m] = offers["accepted"].to_numpy()
-    return {"segment": segment_of(customers), "mask": mask, "action": action, "accepted": accepted}
-
-
-def _rate(index, hit, shape, prior, alpha):
-    """Hit rate per cell, shrunk toward `prior` with `alpha` pseudo-counts."""
-    n, y = np.zeros(shape), np.zeros(shape)
-    np.add.at(n, index, 1)
-    np.add.at(y, index, hit)
-    return (y + alpha * prior) / (n + alpha)
+    bought = np.zeros((len(customers), M), dtype=np.int64)
+    np.bitwise_or.at(bought, (events["c"].to_numpy(), events["m"].to_numpy()), events["a_mask"].to_numpy())
+    state = np.empty((len(customers), M + 1), dtype=np.int64)
+    state[:, 0] = init
+    state[:, 1:] = init[:, None] | np.bitwise_or.accumulate(bought, axis=1)
+    events["state"] = state[events["c"], events["m"]]
+    events["next_state"] = events["state"] | events["a_mask"]
+    return {
+        "groups": groups,
+        "segments": segments,
+        "segment": pd.Index(segments).get_indexer(customers["segment"]),
+        "state": state,
+        "events": events,
+    }
 
 
-def _transitions(g, h, h_next, bits, alpha):
-    """P[g, h, h'] by counting, with two levels of shrinkage:
+def fit(panel, rows, n_months=JOURNEY_MONTHS):
+    """Estimate the MDP per segment from customers `rows` (bool mask) over the
+    first `n_months` months. Returns rewards R[g, s], transitions P[g, s, s'],
+    the exposure n_s[g, s] (customer-months) and the per-(s, a) table."""
+    G, H = len(panel["segments"]), 1 << len(panel["groups"])
+    seg = panel["segment"]
 
-    segment row -> all-segments row -> product-factored prior.
+    # N(s): customer-months spent in each state (the denominator of lambda).
+    keys = seg[rows][:, None] * H + panel["state"][rows, :n_months]
+    n_s = np.bincount(keys.ravel(), minlength=G * H).reshape(G, H)
 
-    The prior treats products as independent: each held product ends at its
-    own churn rate and each unheld product is bought at its own organic rate.
-    It is what the model falls back on for holdings never seen in the data.
-    """
-    H, K = bits.shape
-    b, b_next = bits[h], bits[h_next]
-    churn = ((b == 1) & (b_next == 0)).sum(axis=0) / np.maximum((b == 1).sum(axis=0), 1)
-    buy = ((b == 0) & (b_next == 1)).sum(axis=0) / np.maximum((b == 0).sum(axis=0), 1)
-    per_product = [np.array([[1 - buy[k], buy[k]], [churn[k], 1 - churn[k]]]) for k in range(K)]
-    prior = reduce(np.kron, per_product[::-1])  # [H, H]; bit 0 is least significant
+    ev = panel["events"]
+    ev = ev[rows[ev["c"]] & (ev["m"] < n_months)].assign(g=lambda d: seg[d["c"]], log1p=lambda d: np.log1p(d["reward"]))
+    sa = (
+        ev.groupby(["g", "state", "action"])
+        .agg(next_state=("next_state", "first"), n_sa=("c", "size"), mean_reward=("reward", "mean"), log1p=("log1p", "mean"))
+        .reset_index()
+    )
+    sa["n_s"] = n_s[sa["g"], sa["state"]]
+    sa["lambda"] = sa["n_sa"] / sa["n_s"]
+    sa["sd_lambda"] = np.sqrt(sa["n_sa"]) / sa["n_s"]  # Poisson standard error
+    sa["geom_reward"] = np.expm1(sa.pop("log1p"))  # conservative: geometric mean
 
-    P = np.zeros((N_SEGMENTS, H, H))
-    np.add.at(P, (g, h, h_next), 1)
-    pooled = P.sum(axis=0)
-    pooled = (pooled + alpha * prior) / (pooled.sum(axis=1, keepdims=True) + alpha)
-    n = P.sum(axis=2, keepdims=True)
-    P += alpha * pooled
-    P /= n + alpha
-    P[:, 0, :] = 0.0
-    P[:, 0, 0] = 1.0  # churned is absorbing
+    g, s, s2, lam = (sa[c].to_numpy() for c in ["g", "state", "next_state", "lambda"])
+    R_normal, R_conservative = np.zeros((G, H)), np.zeros((G, H))
+    np.add.at(R_normal, (g, s), lam * sa["mean_reward"].to_numpy())
+    np.add.at(R_conservative, (g, s), lam * sa["geom_reward"].to_numpy())
+
+    move = s2 != s
+    off, var = np.zeros((G, H, H)), np.zeros((G, H, H))
+    np.add.at(off, (g[move], s[move], s2[move]), lam[move])
+    np.add.at(var, (g[move], s[move], s2[move]), sa["sd_lambda"].to_numpy()[move] ** 2)
+    names = state_names(panel["groups"])
+    actions = sa.assign(segment=np.array(panel["segments"])[g], state=names[s], next_state=names[s2])
+    actions = actions[["segment", "state", "action", "next_state", "n_sa", "n_s", "lambda", "sd_lambda", "mean_reward", "geom_reward"]]
+    return {
+        "R_normal": R_normal,
+        "R_conservative": R_conservative,
+        "P": _with_self_loops(off),
+        # Every s -> s' rate lowered by one standard error; the removed mass stays in s.
+        "P_lower": _with_self_loops(np.maximum(off - np.sqrt(var), 0.0)),
+        "n_s": n_s,
+        "actions": actions.sort_values(["segment", "state", "lambda"], ascending=[True, True, False], ignore_index=True),
+    }
+
+
+def _with_self_loops(off):
+    P = off.copy()
+    H = P.shape[1]
+    P[:, np.arange(H), np.arange(H)] = 1.0 - off.sum(axis=2)
+    if (P < -1e-9).any():
+        raise ValueError("a state's outgoing transition rates sum to more than one")
     return P
 
 
-def fit(panel, products, alpha=5.0, alpha_acc=20.0):
-    """Estimate every piece of the MDP from the panel."""
-    rev = products["est_monthly_revenue"].to_numpy()
-    K = len(rev)
-    bits = bits_of(K)
-    H = len(bits)
+def solve(R, P):
+    """Bellman expectation equation, exactly and in one pass.
 
-    mask = panel["mask"]
-    active = mask[:, :-1] > 0
-    g = np.broadcast_to(panel["segment"][:, None], active.shape)[active]
-    h, h_next = mask[:, :-1][active], mask[:, 1:][active]
-    a, ok = panel["action"][active], panel["accepted"][active]
+    Every transition goes to a strict superset s' of s or stays in s, so
 
-    none, rejected = a == 0, (a > 0) & ~ok
-    P_none = _transitions(g[none], h[none], h_next[none], bits, alpha)
-    P_rej = _transitions(g[rejected], h[rejected], h_next[rejected], bits, alpha)
+        V(s) = [R(s) + gamma * sum_{s' != s} P(s'|s) V(s')] / (1 - gamma * P(s|s))
 
-    # Acceptance of offer k: the (segment, holdings, product) cell, shrunk toward
-    # (segment appeal of k) x (how holdings h lift or lower appetite for k).
-    off = a > 0
-    go, ho, ko, yo = g[off], h[off], a[off] - 1, ok[off]
-    acc_k = _rate((ko,), yo, (K,), yo.mean(), alpha_acc)
-    acc_gk = _rate((go, ko), yo, (N_SEGMENTS, K), acc_k, alpha_acc)
-    lift = _rate((ho, ko), yo, (H, K), acc_k, alpha_acc) / acc_k
-    prior = np.clip(acc_gk[:, None, :] * lift[None], 0.0, 0.95)
-    acc = _rate((go, ho, ko), yo, (N_SEGMENTS, H, K), prior, alpha_acc)
-    acc[:, bits == 1] = 0.0
-
-    R = np.repeat((bits @ rev)[:, None], K + 1, axis=1)
-    R[:, 1:] -= OFFER_COST
-    R[0] = 0.0
-
-    valid = np.ones((H, K + 1), dtype=bool)
-    valid[:, 1:] = bits == 0
-    valid[0, 1:] = False
-
-    # Behaviour policy pi[g, h, a], shrunk toward the overall action mix.
-    overall = np.bincount(a, minlength=K + 1) * valid
-    overall = overall / overall.sum(axis=1, keepdims=True)
-    pi = np.zeros((N_SEGMENTS, H, K + 1))
-    np.add.at(pi, (g, h, a), 1)
-    pi = (pi + 10.0 * overall) / (pi.sum(axis=2, keepdims=True) + 10.0)
-
-    return {"P_none": P_none, "P_rej": P_rej, "acc": acc, "R": R, "valid": valid, "pi": pi}
-
-
-def evaluate_policy(model, pi):
-    """Bellman expectation equation, solved exactly per segment:
-
-        V = R_pi + gamma * P_pi V   =>   V = (I - gamma * P_pi)^-1 R_pi
-
-    pi[g, h, a] are action probabilities. Returns V[g, h] and Q[g, h, a], where
-    Q(s,a) = R(s,a) + gamma * E[V(s') | s, a].
+    can be solved from the largest states down: when a state is reached, every
+    V(s') it depends on is already final. States of the same size never lead to
+    each other, so each size is solved at once.
     """
-    R, acc_all = model["R"], model["acc"]
-    G, H, K = acc_all.shape
-    idx = np.arange(H)
-    V, Q = np.zeros((G, H)), np.zeros((G, H, K + 1))
-    for g in range(G):
-        Pn, Pr, acc = model["P_none"][g], model["P_rej"][g], acc_all[g]
-        P = pi[g][:, :1] * Pn + (pi[g][:, 1:] * (1 - acc)).sum(axis=1, keepdims=True) * Pr
-        for k in range(K):
-            w = pi[g][:, 1 + k] * acc[:, k]
-            if w.any():  # accepted: next holdings as under "none", plus product k
-                on = idx[(idx >> k) & 1 == 1]
-                P[:, on] += w[:, None] * (Pn[:, on] + Pn[:, on ^ (1 << k)])
-        V[g] = np.linalg.solve(np.eye(H) - GAMMA * P, (pi[g] * R).sum(axis=1))
-
-        V_next = np.stack([V[g]] + [V[g][idx | (1 << k)] for k in range(K)], axis=1)
-        PnV = Pn @ V_next
-        Q[g, :, 0] = R[:, 0] + GAMMA * PnV[:, 0]
-        Q[g, :, 1:] = R[:, 1:] + GAMMA * (acc * PnV[:, 1:] + (1 - acc) * (Pr @ V[g])[:, None])
-    return V, Q
+    G, H = R.shape
+    size = popcount(H.bit_length() - 1)
+    stay = P[:, np.arange(H), np.arange(H)]
+    V = np.zeros((G, H))
+    for n in range(size.max(), -1, -1):
+        L = size == n  # V[:, L] is still 0 here, so P @ V sums only over s' != s
+        V[:, L] = (R[:, L] + GAMMA * np.einsum("gsh,gh->gs", P[:, L], V)) / (1 - GAMMA * stay[:, L])
+    return V
 
 
-def optimize(model):
-    """Bellman optimality equation  V*(s) = max_a Q*(s,a), by policy iteration:
-    evaluate the policy exactly, switch to any strictly better action, repeat
-    until no state can improve. Returns V*[g, h] and the policy[g, h].
-    """
-    G, H, K = model["acc"].shape
-    policy = np.zeros((G, H), dtype=int)
-    while True:
-        V, Q = evaluate_policy(model, np.eye(K + 1)[policy])
-        Q = np.where(model["valid"], Q, -np.inf)
-        best = Q.argmax(axis=2)
-        better = Q.max(axis=2) > np.take_along_axis(Q, policy[..., None], axis=2)[..., 0] + 1e-9
-        if not better.any():
-            return V, policy
-        policy = np.where(better, best, policy)
+def finite_horizon(R, P, months):
+    """V_T(s) = sum_{t<T} gamma^t E[R(s_t) | s_0 = s], by T Bellman backups."""
+    V = np.zeros_like(R)
+    for _ in range(months):
+        V = R + GAMMA * np.einsum("gsh,gh->gs", P, V)
+    return V
